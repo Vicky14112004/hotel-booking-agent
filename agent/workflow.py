@@ -253,49 +253,49 @@ def parse_locally(message: str, state: HotelBookingState) -> dict:
 
         updates["guest_email"] = email_match.group(0)
 
-    # Name after common introductions
+    
+    # Guest name: support both explicit introductions and plain replies
+    # when the workflow is waiting for the guest's name.
 
     name_match = re.search(
-
         r"\b(?:my name is|name is|guest name is)\s+"
-
         r"([A-Za-z][A-Za-z .'-]{0,78})",
-
         text,
-
         re.IGNORECASE,
-
     )
 
     if name_match:
-
         name = name_match.group(1).strip(" .,")
-
         if email_match:
-
             name = name.split(email_match.group(0))[0].strip(" ,.")
-
         if name:
-
             updates["guest_name"] = name
 
     elif email_match:
-
-        # Supports a simple "Vignesh V, name\\@example.com" reply.
-
+        # Supports: "Vignesh V, name@example.com"
         before_email = text[:email_match.start()].strip(" ,:")
-
         if (
-
             before_email
-
             and len(before_email.split()) <= 5
-
-            and not re.search(r"\b(room|breakfast|guests?)\b", before_email, re.I)
-
+            and not re.search(
+                r"\b(room|breakfast|guests?)\b",
+                before_email,
+                re.IGNORECASE,
+            )
         ):
-
             updates["guest_name"] = before_email
+
+    elif (
+        state.get("intent") == "collect_guest_details"
+        and not state.get("guest_name")
+        and not re.search(r"[@\d]", text)
+        and len(text.split()) <= 5
+        and re.fullmatch(r"[A-Za-z][A-Za-z .'-]{0,98}", text)
+    ):
+        # The assistant explicitly asked for the guest's name,
+        # so treat a plain text reply such as "Vicky Kumar" as the name.
+        updates["guest_name"] = text.strip()
+
 
     # Preserve earlier details; update only what was supplied.
 
