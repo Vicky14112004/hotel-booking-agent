@@ -1,25 +1,42 @@
-from typing import Any, Optional
+
+from typing import Any, Literal, Optional
 from typing_extensions import TypedDict
 from langchain_core.messages import BaseMessage
 
 
+ConversationStep = Literal[
+    "collect_preferences",
+    "collect_breakfast",
+    "show_rooms",
+    "select_room",
+    "collect_guest_name",
+    "collect_guest_email",
+    "awaiting_confirmation",
+    "booking_complete",
+    "cancelled",
+    "error",
+]
+
+
 class HotelBookingState(TypedDict, total=False):
     """Shared state for the conversational hotel booking agent."""
-    use_local_parser: bool
+
     # Conversation
     messages: list[BaseMessage]
     user_message: str
     response: str
-    pending_price_question: bool
+    current_step: ConversationStep
+    intent: Optional[str]
+    use_local_parser: bool
 
-    # Guest preferences
+    # Search preferences
     check_in: Optional[str]
     check_out: Optional[str]
     bed_type: Optional[str]
     breakfast: Optional[bool]
     guests: Optional[int]
 
-    # Availability
+    # Availability and room selection
     availability_result: Optional[dict[str, Any]]
     requested_room_no: Optional[int]
 
@@ -31,7 +48,7 @@ class HotelBookingState(TypedDict, total=False):
     booking_result: Optional[dict[str, Any]]
     email_result: Optional[dict[str, Any]]
 
-    # Workflow control
-    intent: Optional[str]
+    # Confirmation and pending actions
+    pending_price_question: bool
     awaiting_confirmation: bool
     booking_confirmed_by_guest: bool

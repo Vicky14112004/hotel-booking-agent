@@ -1,4 +1,3 @@
-
 import base64
 import html
 import re
@@ -60,6 +59,8 @@ for key, value in DEFAULTS.items():
     if key not in st.session_state:
         st.session_state[key] = value
 
+if "email_preview_shown_for" not in st.session_state:
+    st.session_state.email_preview_shown_for = None
 
 # =========================================================
 # CHAT HELPERS
@@ -155,27 +156,48 @@ def get_email_preview(booking_result, email_result=None):
         }
 
 
+
 def extract_booking_and_email(graph_result):
-    """Read booking/email results from the graph state."""
+    """Read booking/email results and avoid repeating old email previews."""
     booking_result = graph_result.get("booking_result") or {}
     email_result = graph_result.get("email_result") or {}
 
-    # Preserve the existing booking state for the next chat message.
     if booking_result:
         st.session_state.booking_result = booking_result
 
     if email_result:
         st.session_state.email_result = email_result
 
-    preview = get_email_preview(
-        booking_result,
-        email_result,
+    preview = get_email_preview(booking_result, email_result)
+
+    # Show the preview only when this graph response confirms a booking.
+    is_new_confirmation = (
+        booking_result.get("status") == "confirmed"
+        and graph_result.get("intent") == "booking_confirmed"
     )
 
-    if preview:
-        st.session_state.email_result = preview
+    if not is_new_confirmation:
+        return booking_result, None
 
-    return booking_result, preview
+    booking_ref = booking_result.get("booking_ref")
+
+    if not booking_ref:
+        return booking_result, None
+
+    if "email_preview_shown_for" not in st.session_state:
+        st.session_state.email_preview_shown_for = None
+
+    # Don't attach the same booking's preview more than once.
+    if st.session_state.email_preview_shown_for == booking_ref:
+        return booking_result, None
+
+    if preview:
+        st.session_state.email_preview_shown_for = booking_ref
+        st.session_state.email_result = preview
+        return booking_result, preview
+
+    return booking_result, None
+
 
 
 # =========================================================

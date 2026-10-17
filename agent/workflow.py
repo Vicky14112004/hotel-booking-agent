@@ -1,2003 +1,1402 @@
-import json
 
-import os
-
+import logging
 import re
-
 from datetime import date, datetime
-
-from typing import Literal
-
-from dotenv import load_dotenv
-
-from langchain_google_genai import ChatGoogleGenerativeAI
+from typing import Any
 
 from langchain_core.messages import HumanMessage
-
-from langgraph.graph import StateGraph, START, END
+from langgraph.graph import END, START, StateGraph
 
 from agent.state import HotelBookingState
-
 from tools.availability import check_room_availability
-
 from tools.booking import confirm_booking
-
 from services.email_service import create_confirmation_email
 
-load_dotenv()
 
-# --------------------------------------------------
+logger = logging.getLogger(__name__)
 
-# GEMINI MODEL
 
-# --------------------------------------------------
+# ============================================================
+# CONSTANTS AND REGEX
+# ============================================================
 
-def get_model():
+EMAIL_PATTERN = re.compile(
+    r"^[^@\s]+@[^@\s]+\.[^@\s]+$"
+)
 
-    api_key = os.getenv("GEMINI_API_KEY")
+EMAIL_SEARCH_PATTERN = re.compile(
+    r"[^@\s,;]+@[^@\s,;]+\.[^@\s,;]+"
+)
 
-    if not api_key:
+DATE_PATTERN = re.compile(
+    r"\b\d{4}-\d{2}-\d{2}\b"
+    r"|\b\d{1,2}[-/]\d{1,2}[-/]\d{2,4}\b"
+)
 
-        raise ValueError("GEMINI_API_KEY is missing from .env")
+ROOM_PATTERN = re.compile(
+    r"\b(?:room\s*)#?\s*(\d{3})\b",
+    re.IGNORECASE,
+)
 
-    return ChatGoogleGenerativeAI(
+GUEST_COUNT_PATTERN = re.compile(
+    r"\b(\d+)\s*(?:guests?|people|persons?)\b",
+    re.IGNORECASE,
+)
 
-        model="gemini-3.5-flash-lite",
+YES_ANSWERS = {
+    "yes", "y", "yeah", "yep", "sure", "correct",
+    "absolutely", "please do", "confirm", "confirmed",
+}
 
-        api_key=api_key,
+NO_ANSWERS = {
+    "no", "n", "nope", "nah", "not now",
+}
 
-        max_retries=0,
+PREFERENCE_WORDS = {
+    "change", "instead", "different dates", "another date",
+    "breakfast", "bed", "single", "double", "guests",
+    "people", "check-in", "check in", "check-out", "check out",
+}
 
-        timeout=10,
 
+# ============================================================
+# GENERAL HELPERS
+# ============================================================
+
+def _clean(value: Any) -> str:
+    """Convert a value to a trimmed string."""
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _parse_date(value: str) -> date | None:
+    """Parse supported date formats into a date."""
+    value = value.strip()
+
+    formats = (
+        "%Y-%m-%d",
+        "%d-%m-%Y",
+        "%d/%m/%Y",
+        "%d-%m-%y",
+        "%d/%m/%y",
     )
 
-# --------------------------------------------------
-
-# LOCAL MESSAGE PARSER
-
-# --------------------------------------------------
-
-def parse_locally(message: str, state: HotelBookingState) -> dict:
-
-    """Extract common booking details without calling an LLM."""
-
-    text = message.strip()
-
-    lower = text.lower()
-
-    updates = {}
-
-    # Dates: YYYY-MM-DD, DD-MM-YYYY, or DD-MM-YY.
-
-    date_matches = re.findall(
-
-        r"\b(?:\d{4}-\d{2}-\d{2}|\d{2}-\d{2}-\d{2,4})\b",
-
-        text,
-
-    )
-
-    parsed_dates = []
-
-    for value in date_matches:
-
+    for fmt in formats:
         try:
-
-            if re.match(r"^\d{4}-", value):
-
-                parsed = datetime.strptime(value, "%Y-%m-%d")
-
-            elif len(value.rsplit("-", 1)[-1]) == 2:
-
-                parsed = datetime.strptime(value, "%d-%m-%y")
-
-            else:
-
-                parsed = datetime.strptime(value, "%d-%m-%Y")
-
-            parsed_dates.append(parsed.date().isoformat())
-
+            return datetime.strptime(value, fmt).date()
         except ValueError:
-
             continue
 
-    # Two dates in one message replace both dates.
+    return None
 
-    if len(parsed_dates) >= 2:
 
-        updates["check_in"] = parsed_dates[0]
+def _parse_dates(message: str) -> list[date]:
+    """Extract valid date values from a message."""
+    parsed = []
 
-        updates["check_out"] = parsed_dates[1]
+    for match in DATE_PATTERN.finditer(message):
+        value = _parse_date(match.group(0))
 
-    elif len(parsed_dates) == 1:
+        if value is not None and value not in parsed:
+            parsed.append(value)
 
-        # Respect explicit labels when a guest changes only one date.
+    return parsed
 
-        if "check-in" in lower or "checkin" in lower or "check in" in lower:
 
-            updates["check_in"] = parsed_dates[0]
+def _extract_email(message: str) -> str | None:
+    """Extract a valid-looking email address."""
+    match = EMAIL_SEARCH_PATTERN.search(message)
 
-        elif "check-out" in lower or "checkout" in lower or "check out" in lower:
+    if not match:
+        return None
 
-            updates["check_out"] = parsed_dates[0]
+    email = match.group(0).strip(".,;:!?")
 
-        elif not state.get("check_in"):
+    if EMAIL_PATTERN.fullmatch(email):
+        return email
 
-            updates["check_in"] = parsed_dates[0]
+    return None
 
-        else:
 
-            updates["check_out"] = parsed_dates[0]
+def _extract_name_before_email(message: str) -> str | None:
+    """Extract a likely name from 'Harshitha, name@example.com'."""
+    email = _extract_email(message)
 
-    # Bed type
+    if not email:
+        return None
 
-    if re.search(r"\bsingle(?:\s+bed)?\b", lower):
+    name = message.replace(email, "").strip(" \t,;:-")
 
-        updates["bed_type"] = "Single"
+    # Remove common introductory phrases.
+    name = re.sub(
+        r"^(?:my name is|name is|guest name is)\s+",
+        "",
+        name,
+        flags=re.IGNORECASE,
+    ).strip()
 
-    elif re.search(r"\bdouble(?:\s+bed)?\b", lower):
+    if not name or "@" in name or len(name) > 100:
+        return None
 
-        updates["bed_type"] = "Double"
+    # Avoid treating an instruction as the guest's name.
+    if len(name.split()) > 8:
+        return None
 
-    # Breakfast preference. Check negative phrases first.
+    return name
 
-    negative_breakfast_phrases = (
 
-        "don't want breakfast",
-
-        "dont want breakfast",
-
-        "do not want breakfast",
-
-        "don't need breakfast",
-
-        "dont need breakfast",
-
-        "do not need breakfast",
-
-        "without breakfast",
-
-        "no breakfast",
-
-        "breakfast not included",
-
-        "exclude breakfast",
-
-        "not include breakfast",
-
-        "not included breakfast",
-
+def _extract_explicit_name(message: str) -> str | None:
+    """Extract a name introduced explicitly by the guest."""
+    patterns = (
+        r"\bmy name is\s+(.+)",
+        r"\bguest name is\s+(.+)",
+        r"\bname is\s+(.+)",
     )
 
-    positive_breakfast_phrases = (
+    for pattern in patterns:
+        match = re.search(pattern, message, re.IGNORECASE)
 
-        "with breakfast",
+        if match:
+            value = match.group(1).strip(" \t,;.")
 
-        "breakfast yes",
+            email = _extract_email(value)
+            if email:
+                value = value.replace(email, "").strip(" \t,;:-")
 
-        "breakfast included",
+            if value and len(value) <= 100:
+                return value
 
-        "include breakfast",
+    return None
 
-        "want breakfast",
 
-        "need breakfast",
+def _is_yes(message: str) -> bool:
+    return message.strip().lower().rstrip(".!?") in YES_ANSWERS
 
+
+def _is_no(message: str) -> bool:
+    return message.strip().lower().rstrip(".!?") in NO_ANSWERS
+
+
+def _is_explicit_confirmation(message: str) -> bool:
+    """Check for a clear confirmation rather than any positive sentence."""
+    text = message.strip().lower().rstrip(".!?")
+
+    if text in YES_ANSWERS:
+        return True
+
+    return bool(
+        re.search(
+            r"\b(confirm the booking|book it|proceed with booking|"
+            r"yes,? confirm|go ahead and book)\b",
+            text,
+        )
     )
 
-    if any(phrase in lower for phrase in negative_breakfast_phrases):
 
-        updates["breakfast"] = False
+def _is_explicit_decline(message: str) -> bool:
+    text = message.strip().lower().rstrip(".!?")
 
-    elif any(phrase in lower for phrase in positive_breakfast_phrases):
+    if text in NO_ANSWERS:
+        return True
 
-        updates["breakfast"] = True
-
-    # In a pending price conversation, a bare yes/no is often the answer
-    # to the outstanding breakfast question. Do not let Gemini interpret it
-    # as a booking confirmation when no booking is awaiting confirmation.
-    elif state.get("pending_price_question") and state.get("breakfast") is None:
-
-        if lower in {"yes", "yes please", "yeah", "yep", "yup"}:
-
-            updates["breakfast"] = True
-
-        elif lower in {"no", "no thanks", "no please", "nope"}:
-
-            updates["breakfast"] = False
-
-    # Guest count, including a reply such as "3".
-
-    guest_match = re.search(
-
-        r"\b(\d+)\s*(?:guests?|people|persons?)\b",
-
-        lower,
-
+    return bool(
+        re.search(
+            r"\b(cancel the booking|do not book|don't book|"
+            r"no,? cancel|stop the booking)\b",
+            text,
+        )
     )
 
-    if guest_match:
 
-        updates["guests"] = int(guest_match.group(1))
-
-    elif lower.isdigit() and state.get("guests") is None:
-
-        updates["guests"] = int(lower)
-
-    # Room number selection
-
-    room_match = re.search(
-
-        r"\b(?:room\s*)#?(\d{3})\b",
-
-        lower,
-
-    )
-
-    if room_match:
-
-        updates["requested_room_no"] = int(room_match.group(1))
-
-    # Email address
-
-    email_match = re.search(
-
-        r"\b[A-Za-z0-9.\_%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b",
-
-        text,
-
-    )
-
-    if email_match:
-
-        updates["guest_email"] = email_match.group(0)
-
-    
-    # Guest name: support both explicit introductions and plain replies
-    # when the workflow is waiting for the guest's name.
-
-    name_match = re.search(
-        r"\b(?:my name is|name is|guest name is)\s+"
-        r"([A-Za-z][A-Za-z .'-]{0,78})",
-        text,
-        re.IGNORECASE,
-    )
-
-    if name_match:
-        name = name_match.group(1).strip(" .,")
-        if email_match:
-            name = name.split(email_match.group(0))[0].strip(" ,.")
-        if name:
-            updates["guest_name"] = name
-
-    elif email_match:
-        # Supports: "Vignesh V, name@example.com"
-        before_email = text[:email_match.start()].strip(" ,:")
-        if (
-            before_email
-            and len(before_email.split()) <= 5
-            and not re.search(
-                r"\b(room|breakfast|guests?)\b",
-                before_email,
-                re.IGNORECASE,
-            )
-        ):
-            updates["guest_name"] = before_email
-
-    elif (
-        state.get("intent") == "collect_guest_details"
-        and not state.get("guest_name")
-        and not re.search(r"[@\d]", text)
-        and len(text.split()) <= 5
-        and re.fullmatch(r"[A-Za-z][A-Za-z .'-]{0,98}", text)
-    ):
-        # The assistant explicitly asked for the guest's name,
-        # so treat a plain text reply such as "Vicky Kumar" as the name.
-        updates["guest_name"] = text.strip()
-
-
-    # Preserve earlier details; update only what was supplied.
-
-    merged = {
-
-        key: state.get(key)
-
-        for key in [
-
-            "check_in", "check_out", "bed_type", "breakfast", "guests",
-
-            "requested_room_no", "guest_name", "guest_email",
-
-        ]
-
+def _clear_booking_data() -> dict[str, Any]:
+    """Fields invalidated when a new search is requested."""
+    return {
+        "requested_room_no": None,
+        "booking_result": None,
+        "email_result": None,
+        "awaiting_confirmation": False,
+        "booking_confirmed_by_guest": False,
     }
 
-    merged.update(updates)
 
-    affirmative = bool(
+def _add_human_message(state: HotelBookingState) -> list:
+    """Append the current user message without losing earlier messages."""
+    messages = list(state.get("messages") or [])
+    user_message = _clean(state.get("user_message"))
 
-        re.fullmatch(
+    if user_message:
+        messages.append(HumanMessage(content=user_message))
 
-            r"\s*(yes|yeah|yep)\s*[,!. ]*"
+    return messages
 
-            r"(confirm|confirm booking|confirm my booking|"
 
-            r"proceed|go ahead)?\s*[,!. ]*",
+def _format_price(value: Any) -> str:
+    try:
+        return f"₹{float(value):,.2f}"
+    except (ValueError, TypeError):
+        return "Price unavailable"
 
-            lower,
 
-        )
+# ============================================================
+# MESSAGE INTERPRETATION
+# ============================================================
 
-    )
+def interpret_message(state: HotelBookingState) -> dict[str, Any]:
+    """
+    Interpret the user's reply using the explicit conversation step.
 
-    negative = lower in {
-
-        "no", "cancel", "no thanks", "don't book", "do not book",
-
-    }
-
-    if negative and state.get("awaiting_confirmation"):
-
-        updates["intent"] = "cancel_confirmation"
-
-        updates["response"] = (
-
-            "No booking has been made. You can change your preferences "
-
-            "or search for another room."
-
-        )
-
-    elif affirmative and state.get("awaiting_confirmation"):
-
-        updates["intent"] = "confirm_booking"
-
-        updates["booking_confirmed_by_guest"] = True
-
-    elif lower in {"no", "cancel", "no thanks", "don't book", "do not book"}:
-
-        updates["intent"] = "cancel_confirmation"
-
-        updates["booking_confirmed_by_guest"] = False
-
-        updates["awaiting_confirmation"] = False
-
-        updates["response"] = "No booking has been made."
-
-    elif room_match:
-
-        updates["intent"] = "select_room"
-
-    elif (
-
-        email_match
-
-        or name_match
-
-        or (
-
-            state.get("intent") == "collect_guest_details"
-
-            and len(text.split()) >= 1
-
-            and not updates.get("check_in")
-
-            and not updates.get("check_out")
-
-            and not updates.get("bed_type")
-
-            and "breakfast" not in lower
-
-            and not guest_match
-
-        )
-
-    ):
-
-        updates["intent"] = "provide_details"
-
-        # If this is a name-only answer, don't overwrite a previous name
-
-        # unless it looks like a reasonable name.
-
-        if (
-
-            not email_match
-
-            and not name_match
-
-            and not state.get("guest_name")
-
-            and re.fullmatch(r"[A-Za-z][A-Za-z .'-]{0,78}", text)
-
-        ):
-
-            updates["guest_name"] = text.strip()
-
-    elif any(
-
-        phrase in lower
-
-        for phrase in (
-
-            "price", "how much", "cost", "total for", "per night",
-
-            "what will it cost", "rate for",
-
-        )
-
-    ):
-
-        updates["intent"] = "price"
-
-    elif (
-
-        any(updates.get(key) is not None for key in [
-
-            "check_in", "check_out", "bed_type", "breakfast", "guests"
-
-        ])
-
-        or any(
-
-            word in lower
-
-            for word in ["search", "available", "availability", "change dates"]
-
-        )
-
-    ):
-
-        updates["intent"] = "search"
-
-    else:
-
-        updates["intent"] = "other"
-
-        updates["response"] = (
-
-            "Welcome! I can help you book a room. Please tell me your "
-
-            "check-in and check-out dates, bed type, breakfast preference, "
-
-            "and number of guests."
-
-        )
-
-    # Keep a pending price request active while the guest provides details.
-    if updates.get("intent") == "price":
-        updates["pending_price_question"] = True
-
-    updates["messages"] = state.get("messages", []) + [
-
-        HumanMessage(content=text)
-
-    ]
-
-    return updates
-
-# --------------------------------------------------
-
-# INTERPRET USER MESSAGE — GEMINI FIRST
-
-# --------------------------------------------------
-
-def interpret_message(state: HotelBookingState) -> dict:
-
-    message = state.get("user_message", "").strip()
+    Deterministic parsing is used for booking-critical fields so that
+    the flow does not depend on Gemini being available.
+    """
+    message = _clean(state.get("user_message"))
 
     if not message:
-
         return {
-
+            "response": (
+                "Welcome to Grand Credang! I can help you find a room. "
+                "What are your check-in and check-out dates?"
+            ),
+            "current_step": "collect_preferences",
             "intent": "other",
-
-            "response": (
-
-                "Welcome! Please tell me your preferred dates, "
-
-                "bed type, breakfast preference, and number of guests."
-
-            ),
-
         }
 
-    # Handle simple yes/no confirmation deterministically before Gemini.
+    text = message.lower().strip()
+    step = state.get("current_step") or "collect_preferences"
+    
+    # Handle messages after a booking is completed.
+    if step == "booking_complete":
+        text = message.lower().strip()
 
-    # This prevents the model from misclassifying "yes" as "booking".
-
-    # Normalize punctuation so phrases like "yes, confirm", "Yes Confirm!",
-
-    # and "yes confirm booking" are handled consistently.
-
-    lower_message = re.sub(r"[^a-z0-9' ]+", " ", message.lower())
-
-    lower_message = re.sub(r"\s+", " ", lower_message).strip()
-
-    affirmative_messages = {
-
-        "yes", "yes please", "yeah", "yep", "yup",
-
-        "confirm", "confirm booking", "yes confirm",
-
-        "yes confirm booking", "yes please confirm",
-
-        "yes please confirm booking", "confirm my booking",
-
-        "i confirm", "i confirm booking", "proceed",
-
-        "go ahead", "book it", "please book it",
-
-    }
-
-    negative_messages = {
-
-        "no", "no thanks", "cancel", "dont book",
-
-        "do not book", "no cancel", "no please cancel",
-
-        "no i dont want to book", "no i don't want to book",
-
-        "no i do not want to book", "i dont want to book",
-
-        "i don't want to book", "i do not want to book",
-
-        "i do not wish to book", "dont want to book",
-
-        "don't want to book", "do not want to book",
-
-        "no i dont want to confirm", "no i don't want to confirm",
-
-        "no i do not want to confirm", "dont confirm", "don't confirm",
-
-    }
-
-    # Accept natural-language declines and punctuation variations, but only
-
-    # when the guest is explicitly declining the pending reservation.
-
-    is_negative = (
-
-        lower_message in negative_messages
-
-        or bool(re.fullmatch(
-
-            r"(?:no[, ]+)?(?:i )?(?:do not|don't|dont) "
-
-            r"(?:want|wish) to (?:book|confirm)(?: the booking)?",
-
-            lower_message,
-
-        ))
-
-        or bool(re.fullmatch(
-
-            r"no[, ]+(?:i )?(?:do not|don't|dont) "
-
-            r"(?:want|wish) to (?:book|confirm)(?: the booking)?",
-
-            lower_message,
-
-        ))
-
-    )
-
-    # Accept a short affirmative confirmation even if the wording varies.
-
-    is_affirmative = (
-
-        lower_message in affirmative_messages
-
-        or bool(re.fullmatch(
-
-            r"(yes|yeah|yep|yup)( please)? (confirm|book|proceed)( booking| it)?",
-
-            lower_message,
-
-        ))
-
-    )
-
-    # If the last response quoted the cheapest room and invited the guest to
-    # choose it, a plain "yes" means select that quoted room, not start a
-    # booking without a room number.
-    previous_result = state.get("availability_result") or {}
-    previous_rooms = previous_result.get("rooms") or []
-    previous_response = str(state.get("response") or "").lower()
-    previous_intent = state.get("intent")
-    accepted_price_offer = (
-        is_affirmative
-        and not state.get("awaiting_confirmation")
-        and previous_intent == "price"
-        and state.get("pending_price_question") is False
-        and bool(previous_rooms)
-        and (
-            "cheapest available option" in previous_response
-            or "would you like to choose this room" in previous_response
+        new_booking_phrases = (
+            "new booking",
+            "another booking",
+            "book another room",
+            "book a room",
+            "new search",
+            "search rooms",
+            "find a room",
+            "show available rooms",
         )
-    )
-    if accepted_price_offer:
-        nights = int(previous_result.get("nights") or 1)
-        cheapest_room = min(
-            previous_rooms,
-            key=lambda room: float(
-                room.get("total_price")
-                if room.get("total_price") is not None
-                else float(room["price_per_night"]) * nights
-            ),
+
+        has_new_booking_intent = any(
+            phrase in text for phrase in new_booking_phrases
         )
-        print(
-            f"[PRICE] Guest accepted cheapest room offer: "
-            f"Room {cheapest_room.get('room_no')}"
-        )
-        return {
-            "intent": "provide_details",
-            "requested_room_no": cheapest_room["room_no"],
-            "pending_price_question": False,
-            "booking_confirmed_by_guest": False,
-            "awaiting_confirmation": False,
-            "messages": state.get("messages", []) + [
-                HumanMessage(content=message)
-            ],
-            "response": (
-                f"Great, you've selected Room {cheapest_room['room_no']} "
-                f"({cheapest_room['room_type']}). Please provide the guest's full name."
-            ),
-        }
 
-    if state.get("awaiting_confirmation") and is_affirmative:
-
-        print("[CONFIRMATION] Guest explicitly confirmed the booking.")
-
-        return {
-
-            "intent": "confirm_booking",
-
-            "booking_confirmed_by_guest": True,
-
-            "awaiting_confirmation": True,
-
-            "messages": state.get("messages", []) + [HumanMessage(content=message)],
-
-        }
-
-    if state.get("awaiting_confirmation") and is_negative:
-
-        print("[CONFIRMATION] Guest declined the booking.")
-
-        return {
-
-            "intent": "cancel_confirmation",
-
-            "booking_confirmed_by_guest": False,
-
-            "awaiting_confirmation": False,
-
-            "response": (
-
-                "No booking has been made. You can change your preferences "
-
-                "or search for another room whenever you're ready."
-
-            ),
-
-            "messages": state.get("messages", []) + [HumanMessage(content=message)],
-
-        }
-
-    print("\n========== INTERPRET MESSAGE ==========")
-
-    print("USER MESSAGE:", message)
-
-    # Use the local parser only when explicitly requested.
-
-    if state.get("use_local_parser") is True:
-
-        print("[PARSER] Local parser explicitly enabled.")
-
-        return parse_locally(message, state)
-
-    existing_info = {
-
-        "check_in": state.get("check_in"),
-
-        "check_out": state.get("check_out"),
-
-        "bed_type": state.get("bed_type"),
-
-        "breakfast": state.get("breakfast"),
-
-        "guests": state.get("guests"),
-
-        "requested_room_no": state.get("requested_room_no"),
-
-        "guest_name": state.get("guest_name"),
-
-        "guest_email": state.get("guest_email"),
-
-        "intent": state.get("intent"),
-
-        "availability_result": state.get("availability_result"),
-
-    }
-
-    prompt = f"""
-
-You are the conversational intelligence for Grand Credang Hotel.
-
-Extract the guest's latest message into a single valid JSON object.
-
-Do not return Markdown, code fences, or explanations.
-
-Fields:
-
-- check_in: YYYY-MM-DD string or null
-
-- check_out: YYYY-MM-DD string or null
-
-- bed_type: "Single", "Double", or null
-
-- breakfast: true, false, or null
-
-- guests: positive integer or null
-
-- requested_room_no: room number as a string or null
-
-- guest_name: string or null
-
-- guest_email: string or null
-
-- intent: one of
-
-  "availability", "search", "select_room", "booking",
-
-  "price", "change_preferences", "other"
-
-Important rules:
-
-1. Interpret the latest message in the context of the existing booking.
-
-2. Preserve existing information when the guest does not change it.
-
-3. If the guest says they do not want breakfast, return breakfast=false.
-
-4. If the guest says they want breakfast, return breakfast=true.
-
-5. A preference change must use intent="change_preferences".
-
-6. If the guest asks to find available rooms, use intent="availability".
-
-7. If the guest selects a specific room, use intent="select_room".
-
-8. If the guest asks about prices, use intent="price".
-
-9. Never invent dates, room numbers, names, or email addresses.
-
-10. Use null for fields that cannot be extracted from the latest message
-
-    and are not already known from the existing information.
-
-Existing booking information:
-
-{json.dumps(existing_info, default=str)}
-
-Latest guest message:
-
-{message}
-
-Return only the JSON object.
-
-"""
-
-    try:
-
-        print("[GEMINI] Calling Gemini API...")
-
-        response = get_model().invoke(prompt)
-
-        print("[GEMINI] API call succeeded.")
-
-        print("[GEMINI] RAW RESPONSE:", response.content)
-
-        # Gemini can return either a string or a list of content blocks.
-
-        content = response.content
-
-        if isinstance(content, list):
-
-            text_parts = []
-
-            for block in content:
-
-                if isinstance(block, dict):
-
-                    if block.get("type") == "text":
-
-                        text_parts.append(block.get("text", ""))
-
-                elif isinstance(block, str):
-
-                    text_parts.append(block)
-
-            content = "\n".join(text_parts)
-
-        if not isinstance(content, str):
-
-            content = str(content)
-
-        content = content.strip()
-
-        # Remove Markdown fences if the model returns them.
-
-        if content.startswith("```"):
-
-            lines = content.splitlines()
-
-            if lines and lines[0].startswith("```"):
-
-                lines = lines[1:]
-
-            if lines and lines[-1].strip() == "```":
-
-                lines = lines[:-1]
-
-            content = "\n".join(lines).strip()
-
-        # Extract JSON if the response contains surrounding text.
-
-        start = content.find("{")
-
-        end = content.rfind("}")
-
-        if start == -1 or end == -1 or end < start:
-
-            raise ValueError(
-
-                f"Gemini did not return a valid JSON object: {content}"
-
+        has_new_preferences = bool(
+            _parse_dates(message)
+            or re.search(r"\b(single|double)\b", text)
+            or GUEST_COUNT_PATTERN.search(message)
+            or re.search(
+                r"\b(with breakfast|without breakfast|"
+                r"no breakfast|include breakfast|"
+                r"don't want breakfast|dont want breakfast)\b",
+                text,
             )
-
-        extracted = json.loads(content[start:end + 1])
-
-        print("[GEMINI] PARSED JSON:", extracted)
-
-        # Preserve existing booking details unless the guest
-
-        # explicitly provides a replacement value.
-
-        updates = {}
-
-        allowed_fields = [
-
-            "check_in",
-
-            "check_out",
-
-            "bed_type",
-
-            "breakfast",
-
-            "guests",
-
-            "requested_room_no",
-
-            "guest_name",
-
-            "guest_email",
-
-        ]
-
-        for key in allowed_fields:
-
-            value = extracted.get(key)
-
-            # Important: False is a valid value for breakfast.
-
-            if value is not None:
-
-                updates[key] = value
-
-        # Deterministically extract dates/preferences too. Gemini sometimes returns null
-        # for compact inputs such as "checkin 27-11-26 checkout 29-11-26".
-        # The local parser acts as a safety net; explicit Gemini values take priority.
-        local_updates = parse_locally(message, state)
-        for key in allowed_fields:
-            if key not in updates and local_updates.get(key) is not None:
-                updates[key] = local_updates[key]
-
-        valid_intents = {
-
-            "availability",
-
-            "search",
-
-            "select_room",
-
-            "booking",
-
-            "price",
-
-            "change_preferences",
-
-            "other",
-
-        }
-
-        intent = extracted.get("intent", "other")
-
-        if intent not in valid_intents:
-
-            intent = "other"
-
-        # Preserve a price request while the guest supplies missing details
-        # across multiple messages. LangGraph only persists keys declared in
-        # HotelBookingState, so pending_price_question is also declared there.
-        pending_price = bool(state.get("pending_price_question")) or intent == "price"
-
-        # While a price question is waiting for required details, all ordinary
-        # preference replies belong to that request. Gemini may incorrectly
-        # label "yes" as booking or a bed/breakfast change as availability.
-        # Keep routing to the price node until it has enough data to search.
-        # A room selection is allowed only after the price answer has been
-        # delivered and pending_price_question has been cleared.
-        if pending_price and not state.get("awaiting_confirmation"):
-            intent = "price"
-
-        updates["intent"] = intent
-        if pending_price:
-            updates["pending_price_question"] = True
-
-        updates["use_local_parser"] = False
-
-        # Keep conversation history.
-
-        updates["messages"] = (
-
-            state.get("messages", [])
-
-            + [HumanMessage(content=message)]
-
         )
 
-        # Print the fields that will be passed to the graph.
-
-        print("[GEMINI] INTENT:", updates.get("intent"))
-
-        print("[GEMINI] BREAKFAST:", updates.get("breakfast"))
-
-        print("[GEMINI] CHECK-IN:", updates.get("check_in"))
-
-        print("[GEMINI] CHECK-OUT:", updates.get("check_out"))
-
-        print("[GEMINI] GUESTS:", updates.get("guests"))
-
-        print("[GEMINI] ROOM:", updates.get("requested_room_no"))
-
-        print("[GEMINI] Returning extracted information.")
-
-        print("=======================================\n")
-
-        return updates
-
-    except Exception as exc:
-
-        print(
-
-            f"[GEMINI ERROR] {type(exc).__name__}: {exc}"
-
-        )
-
-        print("[PARSER] Falling back to local parser for this message.")
-
-        # Fall back only for this message. Do not permanently disable
-
-        # Gemini for subsequent messages.
-
-        updates = parse_locally(message, state)
-
-        updates["use_local_parser"] = False
-
-        return updates
-
-# --------------------------------------------------
-
-# AVAILABILITY
-
-# --------------------------------------------------
-
-def validate_and_search(state: HotelBookingState) -> dict:
-
-    required = [
-
-        "check_in", "check_out", "bed_type", "breakfast", "guests"
-
-    ]
-
-    missing = [
-
-        key for key in required
-
-        if state.get(key) is None
-
-    ]
-
-    if missing:
-
-        prompts = {
-
-            "check_in": "What is your check-in date? (DD-MM-YYYY)",
-
-            "check_out": "What is your check-out date? (DD-MM-YYYY)",
-
-            "bed_type": "Would you like a Single or Double bed?",
-
-            "breakfast": "Would you like breakfast included? (Yes or No)",
-
-            "guests": "How many guests will be staying?",
-
-        }
-
-        return {
-
-            "intent": "collect_preferences",
-
-            "response": " ".join(prompts[key] for key in missing),
-
-        }
-
-    try:
-
-        check_in = date.fromisoformat(state["check_in"])
-
-        check_out = date.fromisoformat(state["check_out"])
-
-    except (TypeError, ValueError):
-
-        return {
-
-            "intent": "invalid_dates",
-
-            "response": "Please enter valid dates such as 17-12-2026.",
-
-        }
-
-    if check_in < date.today() or check_out <= check_in:
-
-        return {
-
-            "intent": "invalid_dates",
-
-            "response": (
-
-                "Check-in must be today or later, and check-out "
-
-                "must be after check-in. Please provide new dates."
-
-            ),
-
-        }
-
-    result = check_room_availability(
-
-        check_in=state["check_in"],
-
-        check_out=state["check_out"],
-
-        bed_type=state["bed_type"],
-
-        breakfast=state["breakfast"],
-
-        guests=state["guests"],
-
-    )
-
-    result["request"] = {
-
-        "check_in": state["check_in"],
-
-        "check_out": state["check_out"],
-
-        "bed_type": state["bed_type"],
-
-        "breakfast": state["breakfast"],
-
-        "guests": state["guests"],
-
-    }
-
-    status = result.get("status")
-
-    if status == "exact_match":
-
-        rooms = result.get("rooms", [])
-
-        lines = [
-
-            f"Room {room['room_no']} — {room['room_type']}, "
-
-            f"{room['bed_type']} bed, "
-
-            f"breakfast {'included' if room['breakfast'] else 'not included'}, "
-
-            f"₹{float(room['price_per_night']):,.2f}/night, "
-
-            f"total ₹{float(room['total_price']):,.2f}."
-
-            for room in rooms
-
-        ]
-
-        response = (
-
-            "Here are the matching rooms:\n"
-
-            + "\n".join(lines)
-
-            + "\nWhich room would you like to book?"
-
-            if lines else "No exact-match rooms were returned."
-
-        )
-
-    elif status == "alternatives":
-
-        rooms = result.get("rooms", [])[:2]
-
-        lines = [
-
-            f"Room {room['room_no']} — {room['room_type']}, "
-
-            f"{room['bed_type']} bed, "
-
-            f"breakfast {'included' if room['breakfast'] else 'not included'}, "
-
-            f"₹{float(room['price_per_night']):,.2f}/night."
-
-            for room in rooms
-
-        ]
-
-        response = (
-
-            "No exact match is available. Here are alternatives:\n"
-
-            + "\n".join(lines)
-
-            if lines else "No suitable alternatives are available."
-
-        )
-
-    elif status == "invalid_dates":
-
-        response = "The selected dates are invalid. Please try again."
-
-    elif status == "invalid_preferences":
-
-        response = "Please check the room preferences and guest count."
-
-    else:
-
-        response = result.get(
-
-            "message",
-
-            "No suitable rooms are available for those dates and guest count.",
-
-        )
-
-    # Complete a pending price request once all preferences are known. Do not
-    # show the full room list when the guest was trying to find the cheapest room.
-    if state.get("pending_price_question") and status in {"exact_match", "alternatives"}:
-        available_rooms = result.get("rooms", [])
-        if available_rooms:
-            nights = int(result.get("nights") or 1)
-            cheapest = min(
-                available_rooms,
-                key=lambda room: float(
-                    room.get("total_price")
-                    if room.get("total_price") is not None
-                    else float(room["price_per_night"]) * nights
-                ),
-            )
-            total = float(
-                cheapest.get("total_price")
-                if cheapest.get("total_price") is not None
-                else float(cheapest["price_per_night"]) * nights
-            )
+        if has_new_booking_intent or has_new_preferences:
             return {
-                "availability_result": result,
+                "messages": _add_human_message(state),
+                "user_message": message,
+                "current_step": "collect_preferences",
+                "intent": "search",
+                "check_in": None,
+                "check_out": None,
+                "bed_type": None,
+                "breakfast": None,
+                "guests": None,
+                "availability_result": None,
                 "requested_room_no": None,
-                "booking_result": None,
-                "email_result": None,
+                "guest_name": None,
+                "guest_email": None,
                 "awaiting_confirmation": False,
                 "booking_confirmed_by_guest": False,
                 "pending_price_question": False,
-                "intent": "price",
                 "response": (
-                    f"The cheapest available option matching your preferences is "
-                    f"Room {cheapest['room_no']} ({cheapest['room_type']}), at "
-                    f"₹{float(cheapest['price_per_night']):,.2f} per night. "
-                    f"For {nights} night(s), the total is ₹{total:,.2f}. "
-                    f"Breakfast is {'included' if cheapest['breakfast'] else 'not included'}. "
-                    "Would you like to choose this room or compare other options?"
+                    "Of course! Let's start a new booking. "
+                    "What are your check-in and check-out dates?"
                 ),
             }
 
-    # A new search invalidates any previous room selection and confirmation.
-
-    return {
-
-        "availability_result": result,
-
-        "requested_room_no": None,
-
-        "booking_result": None,
-
-        "email_result": None,
-
-        "awaiting_confirmation": False,
-
-        "booking_confirmed_by_guest": False,
-
-        "intent": "availability_result",
-
-        "response": response,
-
-    }
-
-def answer_price_question(state: HotelBookingState) -> dict:
-
-    """Answer price questions using current or previously verified room rates."""
-
-    result = state.get("availability_result") or {}
-
-    rooms = result.get("rooms") or []
-
-    status = result.get("status")
-
-    room_no = state.get("requested_room_no")
-
-    required = ("check_in", "check_out", "bed_type", "breakfast", "guests")
-
-    expected_request = {
-
-        key: state.get(key)
-
-        for key in required
-
-    }
-
-    stored_request = result.get("request") or {}
-
-    stale_results = stored_request != expected_request
-
-    # Refresh availability only if stored results cannot be trusted.
-
-    if stale_results or status not in {"exact_match", "alternatives"} or not rooms:
-
-        if not all(state.get(key) is not None for key in required):
-            next_question = {
-                "check_in": "What is your check-in date? (DD-MM-YYYY)",
-                "check_out": "What is your check-out date? (DD-MM-YYYY)",
-                "bed_type": "Would you prefer a Single or Double bed?",
-                "breakfast": "Would you like breakfast included? (yes or no)",
-                "guests": "How many guests will be staying?",
-            }
-            missing = [key for key in required if state.get(key) is None]
+        if any(
+            word in text
+            for word in (
+                "price", "cost", "costly",
+                "expensive", "cheapest",
+            )
+        ):
             return {
-                "intent": "price",
-                "pending_price_question": True,
+                "messages": _add_human_message(state),
+                "user_message": message,
+                "intent": "other",
+                "current_step": "booking_complete",
                 "response": (
-                    "To calculate the cheapest available room, I need a few details. "
-                    + next_question[missing[0]]
+                    "Your previous booking is confirmed. "
+                    "Would you like to compare room prices in a new search, "
+                    "make another booking, or ask something else?"
                 ),
             }
-
-        refreshed = validate_and_search(state)
-
-        result = refreshed.get("availability_result") or {}
-
-        rooms = result.get("rooms") or []
-
-        status = result.get("status")
-
-        print("\n========== PRICE DEBUG ==========")
-
-        print("USER MESSAGE:", state.get("user_message"))
-
-        print("CHECK-IN:", state.get("check_in"))
-
-        print("CHECK-OUT:", state.get("check_out"))
-
-        print("BED TYPE:", state.get("bed_type"))
-
-        print("BREAKFAST:", state.get("breakfast"))
-
-        print("GUESTS:", state.get("guests"))
-
-        print("AVAILABILITY STATUS:", status)
-
-        print("ROOM COUNT:", len(rooms))
-
-        print("STORED REQUEST:", result.get("request"))
-
-        print("================================\n")
-
-        if status not in {"exact_match", "alternatives"} or not rooms:
-
-            return {
-
-                **refreshed,
-
-                "intent": "price",
-
-                "pending_price_question": True,
-
-                "response": (
-
-                    "I couldn't find an available room matching those "
-
-                    "preferences for your dates. Would you like to change "
-
-                    "your preferences or try different dates?"
-
-                ),
-
-            }
-
-    nights = int(result.get("nights") or 1)
-
-    # A general cheapest-price question should always return the cheapest
-
-    # room, rather than automatically choosing a previously selected room.
-
-    cheapest = min(
-
-        rooms,
-
-        key=lambda room: float(
-
-            room.get("total_price")
-
-            if room.get("total_price") is not None
-
-            else float(room["price_per_night"]) * nights
-
-        ),
-
-    )
-
-    # If the guest explicitly asks about a particular room, answer for it.
-
-    message = (state.get("user_message") or "").lower()
-
-    asks_cheapest = any(
-
-        word in message
-
-        for word in ("cheapest", "lowest price", "least expensive")
-
-    )
-
-    selected = next(
-
-        (
-
-            room for room in rooms
-
-            if str(room.get("room_no")) == str(room_no)
-
-        ),
-
-        None,
-
-    )
-
-    room = cheapest if asks_cheapest or selected is None else selected
-
-    total = float(
-
-        room.get("total_price")
-
-        if room.get("total_price") is not None
-
-        else float(room["price_per_night"]) * nights
-
-    )
-
-    return {
-
-        "availability_result": result,
-
-        "intent": "price",
-
-        "pending_price_question": False,
-
-        "response": (
-
-            f"{'The cheapest available option is' if asks_cheapest or selected is None else 'Your selected room is'} "
-
-            f"Room {room['room_no']} ({room['room_type']}), at "
-
-            f"₹{float(room['price_per_night']):,.2f} per night. "
-
-            f"For {nights} night(s), the total is ₹{total:,.2f}. "
-
-            f"Breakfast is {'included' if room['breakfast'] else 'not included'}. "
-
-            "Would you like to choose this room or compare the other options?"
-
-        ),
-
-    }
-
-# --------------------------------------------------
-
-# ROOM SELECTION AND GUEST DETAILS
-
-# --------------------------------------------------
-
-def handle_room_selection(state: HotelBookingState) -> dict:
-
-    """Validate a selected exact match or alternative against fresh availability."""
-
-    result = state.get("availability_result") or {}
-
-    room_no = state.get("requested_room_no")
-
-    status = result.get("status")
-
-    if status not in {"exact_match", "alternatives"}:
 
         return {
-
-            "intent": "selection_failed",
-
-            "response": "Please search for available rooms first.",
-
-        }
-
-    selected = next(
-
-        (room for room in result.get("rooms", [])
-
-         if str(room["room_no"]) == str(room_no)),
-
-        None,
-
-    )
-
-    if not selected:
-
-        return {
-
-            "intent": "selection_failed",
-
+            "messages": _add_human_message(state),
+            "user_message": message,
+            "intent": "other",
+            "current_step": "booking_complete",
             "response": (
-
-                "That room is not in the latest available options. "
-
-                "Please choose one of the rooms shown."
-
+                "Your booking is confirmed! I'm ready to help with "
+                "another booking, room availability, prices, "
+                "or other hotel-related questions."
             ),
-
         }
 
-    if status == "alternatives":
 
-        fresh_result = check_room_availability(
-
-            check_in=state["check_in"],
-
-            check_out=state["check_out"],
-
-            bed_type=selected["bed_type"],
-
-            breakfast=bool(selected["breakfast"]),
-
-            guests=state["guests"],
-
-        )
-
-        fresh_result["request"] = {
-
-            "check_in": state["check_in"],
-
-            "check_out": state["check_out"],
-
-            "bed_type": selected["bed_type"],
-
-            "breakfast": bool(selected["breakfast"]),
-
-            "guests": state["guests"],
-
-        }
-
-        if fresh_result.get("status") != "exact_match":
-
-            return {
-
-                "availability_result": fresh_result,
-
-                "requested_room_no": None,
-
-                "intent": "availability_result",
-
-                "response": (
-
-                    "That alternative is no longer available for your stay. "
-
-                    "I've refreshed availability; please choose another option."
-
-                ),
-
-            }
-
-        selected_fresh = next(
-
-            (room for room in fresh_result.get("rooms", [])
-
-             if str(room["room_no"]) == str(room_no)),
-
-            None,
-
-        )
-
-        if not selected_fresh:
-
-            return {
-
-                "availability_result": fresh_result,
-
-                "requested_room_no": None,
-
-                "intent": "availability_result",
-
-                "response": (
-
-                    "That alternative is no longer available for your stay. "
-
-                    "Please choose a room from these refreshed results."
-
-                ),
-
-            }
-
-        selected = selected_fresh
-
-        return {
-
-            "availability_result": fresh_result,
-
-            "requested_room_no": selected["room_no"],
-
-            "bed_type": selected["bed_type"],
-
-            "breakfast": bool(selected["breakfast"]),
-
-            "intent": "collect_guest_details",
-
-            "response": (
-
-                f"Room {selected['room_no']} ({selected['room_type']}) is available "
-
-                f"with a {selected['bed_type']} bed and breakfast "
-
-                f"{'included' if selected['breakfast'] else 'not included'}, "
-
-                f"at ₹{float(selected['price_per_night']):,.2f} per night "
-
-                f"(₹{float(selected['total_price']):,.2f} total for "
-
-                f"{fresh_result.get('nights', 1)} night(s)). "
-
-                "Please provide the guest's full name and email address."
-
-            ),
-
-        }
-
-    return {
-
-        "requested_room_no": selected["room_no"],
-
-        "intent": "collect_guest_details",
-
-        "response": (
-
-            f"You selected Room {selected['room_no']} ({selected['room_type']}) at "
-
-            f"₹{float(selected['price_per_night']):,.2f} per night "
-
-            f"(₹{float(selected['total_price']):,.2f} total). "
-
-            "Please provide the guest's full name and email address."
-
-        ),
-
+    updates: dict[str, Any] = {
+        "messages": _add_human_message(state),
+        "user_message": message,
     }
 
-def collect_details(state: HotelBookingState) -> dict:
+    # --------------------------------------------------------
+    # 1. Handle explicit booking confirmation first.
+    # --------------------------------------------------------
+    if step == "awaiting_confirmation":
+        if _is_explicit_confirmation(message):
+            return {
+                **updates,
+                "intent": "confirm_booking",
+                "booking_confirmed_by_guest": True,
+                "awaiting_confirmation": True,
+                "response": "Thank you. I'm processing your booking.",
+            }
 
-    """Collect and validate guest details, then request explicit confirmation."""
-
-    if not state.get("guest_name"):
-
-        return {
-
-            "intent": "collect_guest_details",
-
-            "response": "Please provide the guest's full name.",
-
-        }
-
-    if not state.get("guest_email"):
-
-        return {
-
-            "intent": "collect_guest_details",
-
-            "response": "Please provide the guest's email address.",
-
-        }
-
-    guest_name = str(state.get("guest_name", "")).strip()
-
-    guest_email = str(state.get("guest_email", "")).strip()
-
-    if not guest_name or len(guest_name) > 100:
+        if _is_explicit_decline(message):
+            return {
+                **updates,
+                "intent": "cancel_confirmation",
+                "booking_confirmed_by_guest": False,
+                "awaiting_confirmation": False,
+                "current_step": "cancelled",
+                "response": (
+                    "No booking has been made. "
+                    "Would you like to search for another room?"
+                ),
+            }
 
         return {
-
-            "intent": "collect_guest_details",
-
-            "response": "Please provide a valid full name (100 characters or fewer).",
-
+            **updates,
+            "intent": "other",
+            "response": (
+                "Please reply yes to confirm this booking, "
+                "or no to cancel it."
+            ),
         }
+
+    # --------------------------------------------------------
+    # 2. Handle breakfast yes/no only when expected.
+    # --------------------------------------------------------
+    if step == "collect_breakfast":
+        if _is_yes(message):
+            return {
+                **updates,
+                "breakfast": True,
+                "intent": "search",
+            }
+
+        if _is_no(message):
+            return {
+                **updates,
+                "breakfast": False,
+                "intent": "search",
+            }
+
+    # --------------------------------------------------------
+    # 3. Extract common booking fields.
+    # --------------------------------------------------------
+    dates = _parse_dates(message)
+
+    if len(dates) >= 2:
+        updates["check_in"] = dates[0].isoformat()
+        updates["check_out"] = dates[1].isoformat()
+
+    elif len(dates) == 1:
+        parsed_date = dates[0]
+
+        if re.search(
+            r"\b(check[- ]?in|arrival|arrive)\b",
+            text,
+        ):
+            updates["check_in"] = parsed_date.isoformat()
+
+        elif re.search(
+            r"\b(check[- ]?out|departure|depart)\b",
+            text,
+        ):
+            updates["check_out"] = parsed_date.isoformat()
+
+        elif not state.get("check_in"):
+            updates["check_in"] = parsed_date.isoformat()
+
+        elif not state.get("check_out"):
+            updates["check_out"] = parsed_date.isoformat()
+
+        elif step == "collect_preferences":
+            # If both dates were previously set, a lone date is
+            # ambiguous. Do not silently overwrite either date.
+            updates["response"] = (
+                "Is that your new check-in date or check-out date?"
+            )
+            updates["intent"] = "other"
+            return updates
+
+    bed_match = re.search(r"\b(single|double)\b", text)
+
+    if bed_match:
+        updates["bed_type"] = bed_match.group(1).capitalize()
+
+    guest_match = GUEST_COUNT_PATTERN.search(message)
+
+    if guest_match:
+        updates["guests"] = int(guest_match.group(1))
+
+    elif step == "collect_preferences":
+        # Accept a bare number as a guest count only if it is
+        # not a date or room number.
+        if re.fullmatch(r"\s*[1-9]\d?\s*", message):
+            updates["guests"] = int(message.strip())
+
+    # Breakfast is parsed only from explicit preference language,
+    # except for the stage-specific yes/no handling above.
+    if re.search(
+        r"\b(no breakfast|without breakfast|breakfast not included|"
+        r"don't need breakfast|do not need breakfast)\b",
+        text,
+    ):
+        updates["breakfast"] = False
+
+    elif re.search(
+        r"\b(with breakfast|include breakfast|breakfast included|"
+        r"need breakfast|want breakfast)\b",
+        text,
+    ):
+        updates["breakfast"] = True
+
+    # Extract email and name without discarding previously valid values.
+    email = _extract_email(message)
+
+    if email:
+        updates["guest_email"] = email
+
+    name = _extract_explicit_name(message)
+
+    if not name and email:
+        name = _extract_name_before_email(message)
+
+    if not name and step == "collect_guest_name" and not email:
+        candidate = message.strip(" \t,;.")
+
+        # Do not store obvious commands or preferences as a name.
+        if (
+            candidate
+            and len(candidate) <= 100
+            and not re.search(
+                r"\b(room|breakfast|guest|guests|check-in|check-out|"
+                r"search|price|cancel|book|single|double)\b",
+                candidate,
+                re.IGNORECASE,
+            )
+        ):
+            name = candidate
+
+    if name:
+        updates["guest_name"] = name
+
+    room_match = ROOM_PATTERN.search(message)
+
+    if room_match:
+        updates["requested_room_no"] = int(room_match.group(1))
+
+    elif (
+        step == "select_room"
+        and re.fullmatch(r"\s*\d{3}\s*", message)
+    ):
+        updates["requested_room_no"] = int(message.strip())
+
+    # --------------------------------------------------------
+    # 4. Decide the next action using the conversation step.
+    # --------------------------------------------------------
+
+    # User is choosing a room.
+    if step == "select_room":
+        if updates.get("requested_room_no") is not None:
+            updates["intent"] = "select_room"
+            return updates
+
+        # Preference changes invalidate the previous result.
+        if any(
+            key in updates
+            for key in (
+                "check_in", "check_out", "bed_type",
+                "breakfast", "guests",
+            )
+        ):
+            updates.update(_clear_booking_data())
+            updates["availability_result"] = None
+            updates["intent"] = "search"
+            return updates
+
+        if any(word in text for word in ("price", "cost", "cheapest")):
+            updates["intent"] = "price"
+            updates["pending_price_question"] = True
+            return updates
+
+        updates["intent"] = "other"
+        updates["response"] = (
+            "Please select a room number from the available rooms "
+            "shown above, or tell me which preference you'd like to change."
+        )
+        return updates
+
+    # User is entering guest details.
+    if step in {"collect_guest_name", "collect_guest_email"}:
+        updates["intent"] = "provide_details"
+        return updates
+
+    # User is choosing a breakfast option, but entered something
+    # other than yes/no.
+    if step == "collect_breakfast" and "breakfast" not in updates:
+        if any(word in text for word in ("price", "cost", "cheapest")):
+            updates["intent"] = "price"
+            updates["pending_price_question"] = True
+            return updates
+
+        updates["intent"] = "other"
+        updates["response"] = (
+            "Would you like breakfast included? Please answer yes or no."
+        )
+        return updates
+
+    # Explicit search or preference-change intent.
+    preference_changed = any(
+        key in updates
+        for key in (
+            "check_in", "check_out", "bed_type",
+            "breakfast", "guests",
+        )
+    )
+
+    if preference_changed:
+        updates.update(_clear_booking_data())
+        updates["availability_result"] = None
+        updates["intent"] = "search"
+        return updates
+
+    if any(word in text for word in ("price", "cost", "cheapest")):
+        updates["intent"] = "price"
+        updates["pending_price_question"] = True
+        return updates
+
+    if any(
+        phrase in text
+        for phrase in (
+            "search rooms", "find a room", "show rooms",
+            "available rooms", "availability",
+            "start again", "new search",
+        )
+    ):
+        updates.update(_clear_booking_data())
+        updates["availability_result"] = None
+        updates["intent"] = "search"
+        return updates
+
+    # Handle bare yes/no only for a step that expects a decision.
+    if _is_yes(message) or _is_no(message):
+        if step == "collect_preferences":
+            updates["intent"] = "other"
+            updates["response"] = (
+                "Please tell me your check-in date, check-out date, "
+                "bed type, breakfast preference, and number of guests."
+            )
+            return updates
+
+    # Initial or general conversation.
+    if not state.get("check_in") or not state.get("check_out"):
+        updates["intent"] = "search"
+        return updates
+
+    updates["intent"] = "other"
+    updates["response"] = (
+        "I can help with room availability, room prices, or booking. "
+        "What would you like to do next?"
+    )
+    return updates
+
+
+# ============================================================
+# AVAILABILITY SEARCH
+# ============================================================
+
+def validate_and_search(state: HotelBookingState) -> dict[str, Any]:
+    """Validate required preferences and search the database."""
+    check_in = _clean(state.get("check_in"))
+    check_out = _clean(state.get("check_out"))
+    bed_type = state.get("bed_type")
+    breakfast = state.get("breakfast")
+    guests = state.get("guests")
+
+    missing = []
+
+    if not check_in:
+        missing.append("check-in date")
+
+    if not check_out:
+        missing.append("check-out date")
+
+    if bed_type not in {"Single", "Double"}:
+        missing.append("bed type (Single or Double)")
+
+    if not isinstance(breakfast, bool):
+        missing.append("breakfast preference (yes or no)")
 
     if (
-
-        len(guest_email) > 255
-
-        or not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", guest_email)
-
+        isinstance(guests, bool)
+        or not isinstance(guests, int)
+        or guests < 1
     ):
+        missing.append("number of guests")
+
+    if missing:
+        first_missing = missing[0]
+
+        if first_missing == "check-in date":
+            response = "What is your check-in date?"
+            step = "collect_preferences"
+
+        elif first_missing == "check-out date":
+            response = "What is your check-out date?"
+            step = "collect_preferences"
+
+        elif first_missing.startswith("bed type"):
+            response = "Would you prefer a Single or Double bed?"
+            step = "collect_preferences"
+
+        elif first_missing.startswith("breakfast"):
+            response = "Would you like breakfast included? Please answer yes or no."
+            step = "collect_breakfast"
+
+        else:
+            response = "How many guests will be staying?"
+            step = "collect_preferences"
 
         return {
-
-            "intent": "collect_guest_details",
-
-            "response": "That email address doesn't look valid. Please enter a valid email address.",
-
+            "response": response,
+            "current_step": step,
+            "intent": "collect_preferences",
         }
 
-    result = state.get("availability_result") or {}
+    parsed_check_in = _parse_date(check_in)
+    parsed_check_out = _parse_date(check_out)
 
-    room_no = state.get("requested_room_no")
-
-    selected = next(
-
-        (
-
-            room for room in result.get("rooms", [])
-
-            if str(room["room_no"]) == str(room_no)
-
-        ),
-
-        None,
-
-    )
-
-    if result.get("status") != "exact_match" or not selected:
-
+    if parsed_check_in is None or parsed_check_out is None:
         return {
-
-            "intent": "selection_failed",
-
-            "response": "Please select a currently available room again.",
-
+            "response": "Please provide dates in YYYY-MM-DD format.",
+            "current_step": "collect_preferences",
+            "intent": "collect_preferences",
         }
 
-    nights = int(result.get("nights") or 1)
+    if parsed_check_in < date.today():
+        return {
+            "response": "Check-in cannot be in the past. What date would you like instead?",
+            "current_step": "collect_preferences",
+            "intent": "collect_preferences",
+        }
 
-    total = float(selected.get("total_price", selected["price_per_night"] * nights))
+    if parsed_check_out <= parsed_check_in:
+        return {
+            "response": "Check-out must be after check-in. Please provide a valid check-out date.",
+            "current_step": "collect_preferences",
+            "intent": "collect_preferences",
+        }
 
-    return {
+    try:
+        result = check_room_availability(
+            check_in=parsed_check_in.isoformat(),
+            check_out=parsed_check_out.isoformat(),
+            bed_type=bed_type,
+            breakfast=breakfast,
+            guests=guests,
+        )
+    except Exception:
+        logger.exception("Room availability search failed")
+        return {
+            "response": (
+                "I couldn't check room availability right now. "
+                "Please try again shortly."
+            ),
+            "current_step": "error",
+            "intent": "availability_error",
+        }
 
-        "intent": "awaiting_confirmation",
-
-        "awaiting_confirmation": True,
-
-        "booking_confirmed_by_guest": False,
-
-        "response": (
-
-            "Please review your booking:\n"
-
-            f"Room {selected['room_no']} — {selected['room_type']}\n"
-
-            f"Bed: {selected['bed_type']}\n"
-
-            f"Check-in: {state['check_in']}\n"
-
-            f"Check-out: {state['check_out']}\n"
-
-            f"Guests: {state['guests']}\n"
-
-            f"Breakfast: {'included' if selected['breakfast'] else 'not included'}\n"
-
-            f"Price per night: ₹{float(selected['price_per_night']):,.2f}\n"
-
-            f"Number of nights: {nights}\n"
-
-            f"Total: ₹{total:,.2f}\n\n"
-
-            "Reply 'yes, confirm booking' to proceed, or 'no' to cancel."
-
-        ),
-
+    result = dict(result or {})
+    result["request"] = {
+        "check_in": parsed_check_in.isoformat(),
+        "check_out": parsed_check_out.isoformat(),
+        "bed_type": bed_type,
+        "breakfast": breakfast,
+        "guests": guests,
     }
 
-# --------------------------------------------------
+    status = result.get("status")
+    rooms = result.get("rooms") or []
 
-# BOOKING AND MOCK EMAIL
+    if status == "exact_match" and rooms:
+        lines = [
+            f"Found {len(rooms)} matching room(s) for "
+            f"{result.get('nights', 0)} night(s):"
+        ]
 
-# --------------------------------------------------
+        for room in rooms:
+            lines.append(
+                f"Room {room['room_no']} — {room.get('room_type', 'Room')}, "
+                f"{room['bed_type']} bed, "
+                f"breakfast {'included' if room['breakfast'] else 'not included'}, "
+                f"{_format_price(room['price_per_night'])} per night, "
+                f"total {_format_price(room['total_price'])}."
+            )
 
-def book_room(state: HotelBookingState) -> dict:
+        lines.append("Which room would you like to book?")
+        response = "\n".join(lines)
 
-    # Prevent accidental duplicate bookings.
+        return {
+            "availability_result": result,
+            "requested_room_no": None,
+            "booking_result": None,
+            "email_result": None,
+            "awaiting_confirmation": False,
+            "booking_confirmed_by_guest": False,
+            "current_step": "select_room",
+            "intent": "availability_result",
+            "response": response,
+            "pending_price_question": False,
+        }
 
+    if status == "alternatives" and rooms:
+        lines = [
+            "No exact match is available, but these alternatives may work:"
+        ]
+
+        for room in rooms[:2]:
+            lines.append(
+                f"Room {room['room_no']} — {room.get('room_type', 'Room')}, "
+                f"{room['bed_type']} bed, "
+                f"breakfast {'included' if room['breakfast'] else 'not included'}, "
+                f"{_format_price(room['price_per_night'])} per night, "
+                f"total {_format_price(room['total_price'])}."
+            )
+
+        lines.append("Would you like one of these rooms, or would you prefer to change your requirements?")
+        response = "\n".join(lines)
+
+        return {
+            "availability_result": result,
+            "requested_room_no": None,
+            "booking_result": None,
+            "email_result": None,
+            "awaiting_confirmation": False,
+            "booking_confirmed_by_guest": False,
+            "current_step": "select_room",
+            "intent": "availability_result",
+            "response": response,
+            "pending_price_question": False,
+        }
+
+    message = result.get(
+        "message",
+        "No suitable rooms are available for those preferences.",
+    )
+
+    return {
+        "availability_result": result,
+        "requested_room_no": None,
+        "current_step": "collect_preferences",
+        "intent": "availability_result",
+        "response": message + " You can try different dates or preferences.",
+        "pending_price_question": False,
+    }
+
+
+# ============================================================
+# ROOM SELECTION
+# ============================================================
+
+def handle_room_selection(state: HotelBookingState) -> dict[str, Any]:
+    """Validate selection against the latest availability result."""
+    room_no = state.get("requested_room_no")
+    availability = state.get("availability_result") or {}
+    rooms = availability.get("rooms") or []
+
+    if not isinstance(room_no, int) or isinstance(room_no, bool):
+        return {
+            "response": "Please choose a valid room number from the available rooms.",
+            "current_step": "select_room",
+            "intent": "select_room",
+        }
+
+    if availability.get("status") not in {"exact_match", "alternatives"}:
+        return {
+            "response": "Your previous room list is no longer valid. Let me search again.",
+            "intent": "search",
+            "availability_result": None,
+        }
+
+    selected = next(
+        (
+            room for room in rooms
+            if int(room.get("room_no", -1)) == room_no
+        ),
+        None,
+    )
+
+    if selected is None:
+        return {
+            "response": (
+                "That room isn't in the latest available-room list. "
+                "Please select one of the rooms shown."
+            ),
+            "current_step": "select_room",
+            "intent": "select_room",
+            "requested_room_no": None,
+        }
+
+    guests = state.get("guests")
+
+    if (
+        isinstance(guests, bool)
+        or not isinstance(guests, int)
+        or guests < 1
+        or int(selected.get("max_guests", 0)) < guests
+    ):
+        return {
+            "response": (
+                "That room cannot accommodate your guest count. "
+                "Please choose another available room."
+            ),
+            "current_step": "select_room",
+            "intent": "select_room",
+            "requested_room_no": None,
+        }
+
+    # If an alternative was chosen, update the search preferences to
+    # match that room and refresh availability before proceeding.
+    selected_bed = selected.get("bed_type")
+    selected_breakfast = bool(selected.get("breakfast"))
+
+    if (
+        availability.get("status") == "alternatives"
+        and (
+            selected_bed != state.get("bed_type")
+            or selected_breakfast != state.get("breakfast")
+        )
+    ):
+        try:
+            refreshed = check_room_availability(
+                check_in=state.get("check_in"),
+                check_out=state.get("check_out"),
+                bed_type=selected_bed,
+                breakfast=selected_breakfast,
+                guests=guests,
+            )
+        except Exception:
+            logger.exception("Alternative-room refresh failed")
+            return {
+                "response": (
+                    "I couldn't verify that alternative just now. "
+                    "Please try selecting a room again."
+                ),
+                "current_step": "select_room",
+                "intent": "select_room",
+                "requested_room_no": None,
+            }
+
+        refreshed = dict(refreshed or {})
+        refreshed["request"] = {
+            "check_in": state.get("check_in"),
+            "check_out": state.get("check_out"),
+            "bed_type": selected_bed,
+            "breakfast": selected_breakfast,
+            "guests": guests,
+        }
+
+        refreshed_rooms = refreshed.get("rooms") or []
+        still_available = any(
+            int(room.get("room_no", -1)) == room_no
+            for room in refreshed_rooms
+        )
+
+        if not still_available:
+            return {
+                "availability_result": refreshed,
+                "requested_room_no": None,
+                "current_step": "select_room",
+                "intent": "availability_result",
+                "response": (
+                    "That alternative is no longer available. "
+                    "Please choose from the updated room list."
+                ),
+            }
+
+        availability = refreshed
+
+    return {
+        "availability_result": availability,
+        "requested_room_no": room_no,
+        "bed_type": selected_bed,
+        "breakfast": selected_breakfast,
+        "current_step": (
+            "collect_guest_email"
+            if state.get("guest_name")
+            else "collect_guest_name"
+        ),
+        "intent": "provide_details",
+        "awaiting_confirmation": False,
+        "booking_confirmed_by_guest": False,
+        "response": (
+            f"You selected Room {room_no}. "
+            f"It costs {_format_price(selected.get('price_per_night'))} per night "
+            f"for {availability.get('nights', 0)} night(s), "
+            f"with a total of {_format_price(selected.get('total_price'))}. "
+            + (
+                "Please provide your email address."
+                if state.get("guest_name")
+                else "Please provide the guest's full name and email address."
+            )
+        ),
+    }
+
+
+# ============================================================
+# GUEST DETAILS AND CONFIRMATION
+# ============================================================
+
+def collect_details(state: HotelBookingState) -> dict[str, Any]:
+    """Validate guest information and show a confirmation summary."""
+    name = _clean(state.get("guest_name"))
+    email = _clean(state.get("guest_email"))
+
+    if not name:
+        return {
+            "response": "Please provide the guest's full name.",
+            "current_step": "collect_guest_name",
+            "intent": "provide_details",
+        }
+
+    if len(name) > 100:
+        return {
+            "response": "The guest's name must be 100 characters or fewer. Please enter the name again.",
+            "current_step": "collect_guest_name",
+            "intent": "provide_details",
+        }
+
+    if not email:
+        return {
+            "response": "Please provide the guest's email address.",
+            "current_step": "collect_guest_email",
+            "intent": "provide_details",
+        }
+
+    if len(email) > 255 or not EMAIL_PATTERN.fullmatch(email):
+        return {
+            "response": "That email address doesn't look valid. Please enter a valid email address.",
+            "current_step": "collect_guest_email",
+            "intent": "provide_details",
+        }
+
+    availability = state.get("availability_result") or {}
+    rooms = availability.get("rooms") or []
+    room_no = state.get("requested_room_no")
+
+    if availability.get("status") not in {"exact_match", "alternatives"}:
+        return {
+            "response": "Your room availability needs to be refreshed. Let me search again.",
+            "intent": "search",
+            "availability_result": None,
+        }
+
+    selected = next(
+        (
+            room for room in rooms
+            if int(room.get("room_no", -1)) == room_no
+        ),
+        None,
+    )
+
+    if selected is None:
+        return {
+            "response": "Please select a valid room from the latest availability results.",
+            "current_step": "select_room",
+            "intent": "select_room",
+            "requested_room_no": None,
+        }
+
+    nights = availability.get("nights", 0)
+    total = selected.get("total_price")
+
+    response = (
+        "Please review your booking details:\n\n"
+        f"- Guest: {name}\n"
+        f"- Email: {email}\n"
+        f"- Room: {room_no} ({selected.get('room_type', 'Room')})\n"
+        f"- Check-in: {state.get('check_in')}\n"
+        f"- Check-out: {state.get('check_out')}\n"
+        f"- Nights: {nights}\n"
+        f"- Guests: {state.get('guests')}\n"
+        f"- Bed: {selected.get('bed_type')}\n"
+        f"- Breakfast: {'Included' if selected.get('breakfast') else 'Not included'}\n"
+        f"- Price per night: {_format_price(selected.get('price_per_night'))}\n"
+        f"- Total: {_format_price(total)}\n\n"
+        "Would you like me to confirm this booking? Please reply yes or no."
+    )
+
+    return {
+        "guest_name": name,
+        "guest_email": email,
+        "current_step": "awaiting_confirmation",
+        "intent": "awaiting_confirmation",
+        "awaiting_confirmation": True,
+        "booking_confirmed_by_guest": False,
+        "response": response,
+    }
+
+
+def cancel_confirmation(state: HotelBookingState) -> dict[str, Any]:
+    """Stop before booking when the guest declines confirmation."""
+    return {
+        "awaiting_confirmation": False,
+        "booking_confirmed_by_guest": False,
+        "current_step": "cancelled",
+        "intent": "cancelled",
+        "response": (
+            "No booking has been created. "
+            "You can ask me to search for another room whenever you're ready."
+        ),
+    }
+
+
+# ============================================================
+# PRICE QUESTIONS
+# ============================================================
+
+def answer_price_question(state: HotelBookingState) -> dict[str, Any]:
+    """Answer pricing questions using database availability results."""
+    availability = state.get("availability_result") or {}
+    rooms = availability.get("rooms") or []
+
+    # Refresh results when the stored search does not match current state.
+    request = availability.get("request") or {}
+
+    current_request = {
+        "check_in": state.get("check_in"),
+        "check_out": state.get("check_out"),
+        "bed_type": state.get("bed_type"),
+        "breakfast": state.get("breakfast"),
+        "guests": state.get("guests"),
+    }
+
+    if (
+        not rooms
+        or availability.get("status") not in {"exact_match", "alternatives"}
+        or any(request.get(key) != value for key, value in current_request.items())
+    ):
+        result = validate_and_search(state)
+
+        # If the search has only asked for missing preferences,
+        # return that response instead of fabricating a price.
+        refreshed = result.get("availability_result") or {}
+
+        if not refreshed.get("rooms"):
+            return result
+
+        availability = refreshed
+        rooms = availability.get("rooms") or []
+
+    if not rooms:
+        return {
+            "response": "There are no available rooms to price for those preferences.",
+            "intent": "price",
+        }
+
+    selected_room_no = state.get("requested_room_no")
+    selected = next(
+        (
+            room for room in rooms
+            if int(room.get("room_no", -1)) == selected_room_no
+        ),
+        None,
+    )
+
+    if selected is None:
+        selected = min(
+            rooms,
+            key=lambda room: float(room.get("price_per_night", 0)),
+        )
+
+    response = (
+        f"Room {selected['room_no']} costs "
+        f"{_format_price(selected.get('price_per_night'))} per night "
+        f"for {availability.get('nights', 0)} night(s), "
+        f"with a total of {_format_price(selected.get('total_price'))}. "
+    )
+
+    if selected_room_no is None:
+        response += (
+            "Would you like to choose this room, or would you like "
+            "to compare the other available options?"
+        )
+    else:
+        response += "Would you like to continue with this room?"
+
+    return {
+        "availability_result": availability,
+        "pending_price_question": False,
+        "current_step": "select_room",
+        "intent": "price",
+        "response": response,
+    }
+
+
+# ============================================================
+# CREATE BOOKING
+# ============================================================
+
+def book_room(state: HotelBookingState) -> dict[str, Any]:
+    """Create a booking only after explicit guest confirmation."""
     existing_booking = state.get("booking_result") or {}
 
     if existing_booking.get("status") == "confirmed":
-
         return {
-
             "intent": "booking_confirmed",
-
-            "awaiting_confirmation": False,
-
-            "booking_confirmed_by_guest": False,
-
+            "current_step": "booking_complete",
             "response": (
-
-                f"Your booking is already confirmed. Reference: "
-
-                f"{existing_booking.get('booking_ref', 'N/A')}."
-
+                f"Your booking is already confirmed. "
+                f"Reference: {existing_booking.get('booking_ref')}."
             ),
-
         }
 
     if not state.get("booking_confirmed_by_guest"):
-
         return {
-
+            "response": "Please confirm the booking before I proceed.",
             "intent": "awaiting_confirmation",
-
-            "response": "Please explicitly confirm before I make the booking.",
-
+            "current_step": "awaiting_confirmation",
+            "awaiting_confirmation": True,
         }
 
-    result = state.get("availability_result") or {}
-
-    rooms = result.get("rooms", [])
-
+    availability = state.get("availability_result") or {}
+    rooms = availability.get("rooms") or []
     room_no = state.get("requested_room_no")
 
     selected = next(
-
-        (room for room in rooms if str(room["room_no"]) == str(room_no)),
-
+        (
+            room for room in rooms
+            if int(room.get("room_no", -1)) == room_no
+        ),
         None,
-
     )
 
-    if not selected:
-
+    if selected is None:
         return {
-
-            "intent": "booking_failed",
-
-            "response": "Please search availability and select a room again.",
-
+            "response": "The selected room is no longer in the current results. Please search again.",
+            "intent": "search",
+            "availability_result": None,
+            "requested_room_no": None,
+            "booking_confirmed_by_guest": False,
+            "awaiting_confirmation": False,
         }
 
-    booking = confirm_booking(
+    try:
+        result = confirm_booking(
+            room_no=room_no,
+            check_in=state.get("check_in"),
+            check_out=state.get("check_out"),
+            guest_name=state.get("guest_name"),
+            guest_email=state.get("guest_email"),
+            guests=state.get("guests"),
+            bed_type=selected.get("bed_type"),
+            breakfast=bool(selected.get("breakfast")),
+        )
+    except Exception:
+        logger.exception("Booking creation failed")
+        result = {
+            "status": "booking_error",
+            "message": "We couldn't complete your booking. Please try again.",
+        }
 
-        room_no=selected["room_no"],
-
-        check_in=state["check_in"],
-
-        check_out=state["check_out"],
-
-        guest_name=state["guest_name"],
-
-        guest_email=state["guest_email"],
-
-        guests=state["guests"],
-
-        bed_type=state["bed_type"],
-
-        breakfast=state["breakfast"],
-
-    )
-
-    if booking.get("status") != "confirmed":
-
+    if result.get("status") != "confirmed":
         return {
-
-            "booking_result": booking,
-
+            "booking_result": result,
+            "booking_confirmed_by_guest": False,
+            "awaiting_confirmation": False,
+            "current_step": "select_room",
             "intent": "booking_failed",
-
             "response": (
-
-                "The booking could not be confirmed. The room may have "
-
-                "been booked by someone else. Please search again."
-
+                result.get("message")
+                or "The booking could not be completed. Please search again."
             ),
-
         }
 
     return {
-
-        "booking_result": booking,
-
-        "intent": "booking_confirmed",
-
-        "awaiting_confirmation": False,
-
+        "booking_result": result,
         "booking_confirmed_by_guest": False,
-
+        "awaiting_confirmation": False,
+        "current_step": "booking_complete",
+        "intent": "booking_confirmed",
         "response": (
-
-            f"Your booking is confirmed! Reference: "
-
-            f"{booking.get('booking_ref', 'N/A')}."
-
+            "Your booking has been confirmed!\n"
+            f"Booking reference: {result.get('booking_ref')}\n"
+            f"Room: {result.get('room_no')}\n"
+            f"Guest: {result.get('guest_name')}\n"
+            f"Total: {_format_price(result.get('total_price'))}"
         ),
-
     }
 
-def send_confirmation_email(state: HotelBookingState) -> dict:
 
+# ============================================================
+# EMAIL PREVIEW
+# ============================================================
+
+def send_confirmation_email(state: HotelBookingState) -> dict[str, Any]:
+    """Generate the confirmation email preview after successful booking."""
     booking = state.get("booking_result") or {}
 
     if booking.get("status") != "confirmed":
-
         return {
-
             "intent": "booking_failed",
-
-            "response": "No confirmation email was generated.",
-
+            "response": "An email preview cannot be generated because the booking is not confirmed.",
         }
 
-    email_result = create_confirmation_email(booking)
+    existing_email = state.get("email_result")
+
+    if existing_email:
+        return {
+            "email_result": existing_email,
+            "intent": "booking_confirmed",
+            "response": state.get("response", "Your booking is confirmed."),
+        }
+
+    try:
+        email_result = create_confirmation_email(booking)
+    except Exception:
+        logger.exception("Confirmation email preview creation failed")
+        email_result = {
+            "status": "email_preview_error",
+            "message": (
+                "The booking is confirmed, but the email preview "
+                "could not be generated."
+            ),
+        }
+
+    response = _clean(state.get("response")) or "Your booking is confirmed."
+
+    if email_result.get("status") == "email_preview_error":
+        response += "\n\nThe email preview could not be generated."
+
+    else:
+        response += (
+            "\n\nA confirmation email preview has been prepared. "
+            "This is a preview and does not mean an email was sent."
+        )
 
     return {
-
         "email_result": email_result,
-
-        "response": state.get("response", "")
-
-        + "\nA mock confirmation email was generated. No real email was sent.",
-
+        "intent": "booking_confirmed",
+        "current_step": "booking_complete",
+        "response": response,
     }
 
-# --------------------------------------------------
 
-# GRAPH ROUTING
+# ============================================================
+# ROUTING
+# ============================================================
 
-# --------------------------------------------------
-
-def route_after_interpretation(
-
-    state: HotelBookingState,
-
-) -> Literal["search", "select", "details", "book", "price", "end"]:
-
+def route_after_interpretation(state: HotelBookingState) -> str:
+    """Route based on the interpreted action."""
     intent = state.get("intent")
 
-    if intent in {"search", "availability", "change_preferences"}:
+    routes = {
+        "search": "search",
+        "availability": "search",
+        "change_preferences": "search",
+        "select_room": "select",
+        "provide_details": "details",
+        "booking": "details",
+        "confirm_booking": "book",
+        "cancel_confirmation": "cancel",
+        "price": "price",
+    }
 
-        return "search"
+    return routes.get(intent, "end")
 
-    if intent == "select_room":
 
-        return "select"
+def route_after_booking(state: HotelBookingState) -> str:
+    booking = state.get("booking_result") or {}
 
-    if intent in {"provide_details", "booking"}:
-
-        return "details"
-
-    if intent == "confirm_booking":
-
-        return "book"
-
-    if intent == "price":
-
-        return "price"
+    if booking.get("status") == "confirmed":
+        return "email"
 
     return "end"
 
-def build_workflow():
 
+# ============================================================
+# BUILD GRAPH
+# ============================================================
+
+def build_workflow():
+    """Build the LangGraph hotel booking workflow."""
     graph = StateGraph(HotelBookingState)
 
     graph.add_node("interpret", interpret_message)
-
     graph.add_node("search", validate_and_search)
-
     graph.add_node("select", handle_room_selection)
-
     graph.add_node("details", collect_details)
-
     graph.add_node("price", answer_price_question)
-
     graph.add_node("book", book_room)
-
     graph.add_node("email", send_confirmation_email)
+    graph.add_node("cancel", cancel_confirmation)
 
     graph.add_edge(START, "interpret")
 
     graph.add_conditional_edges(
-
         "interpret",
-
         route_after_interpretation,
-
         {
-
             "search": "search",
-
             "select": "select",
-
             "details": "details",
-
             "book": "book",
-
             "price": "price",
-
+            "cancel": "cancel",
             "end": END,
-
         },
-
     )
 
+    # Each conversational node returns to the UI. The next user
+    # message starts another graph invocation with the saved state.
     graph.add_edge("search", END)
-
     graph.add_edge("select", END)
-
     graph.add_edge("details", END)
-
     graph.add_edge("price", END)
+    graph.add_edge("cancel", END)
 
     graph.add_conditional_edges(
-
         "book",
-
-        lambda state: (
-
-            "email"
-
-            if state.get("intent") == "booking_confirmed"
-
-            else "end"
-
-        ),
-
-        {"email": "email", "end": END},
-
+        route_after_booking,
+        {
+            "email": "email",
+            "end": END,
+        },
     )
 
     graph.add_edge("email", END)
 
     return graph.compile()
+
 
 hotel_booking_graph = build_workflow()
